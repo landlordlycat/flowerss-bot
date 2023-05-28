@@ -14,8 +14,9 @@ import (
 	"testing"
 	"text/template"
 
+	"github.com/go-sql-driver/mysql"
 	"github.com/spf13/viper"
-	tb "gopkg.in/tucnak/telebot.v2"
+	tb "gopkg.in/telebot.v3"
 )
 
 func init() {
@@ -49,7 +50,6 @@ func init() {
 		viper.SetConfigFile(filepath.Join(workDir, "config.yml"))
 	}
 
-	fmt.Println(logo)
 	err := viper.ReadInConfig() // Find and read the config file
 	if err != nil {             // Handle errors reading the config file
 		panic(fmt.Errorf("Fatal error config file: %s", err))
@@ -116,13 +116,16 @@ func init() {
 
 	if viper.IsSet("mysql.host") {
 		EnableMysql = true
-		Mysql = MysqlConfig{
-			Host:     viper.GetString("mysql.host"),
-			Port:     viper.GetInt("mysql.port"),
-			User:     viper.GetString("mysql.user"),
-			Password: viper.GetString("mysql.password"),
-			DB:       viper.GetString("mysql.database"),
-		}
+		mysqlConfig = mysql.NewConfig()
+		mysqlConfig.Net = "tcp"
+		mysqlConfig.Addr = fmt.Sprintf("%s:%d", viper.GetString("mysql.host"), viper.GetInt("mysql.port"))
+		mysqlConfig.Passwd = viper.GetString("mysql.host")
+		mysqlConfig.User = viper.GetString("mysql.user")
+		mysqlConfig.Passwd = viper.GetString("mysql.password")
+		mysqlConfig.DBName = viper.GetString("mysql.database")
+		mysqlConfig.ParseTime = true
+		mysqlConfig.Params = map[string]string{}
+		mysqlConfig.Params["charset"] = "utf8mb4"
 	}
 
 	if !EnableMysql {
@@ -131,14 +134,13 @@ func init() {
 		} else {
 			SQLitePath = filepath.Join(workDir, "data.db")
 		}
-		log.Println("DB Path:", SQLitePath)
 		// 判断并创建SQLite目录
 		dir := path.Dir(SQLitePath)
 		_, err := os.Stat(dir)
 		if err != nil {
 			err := os.MkdirAll(dir, os.ModeDir)
 			if err != nil {
-				log.Printf("mkdir failed![%v]\n", err)
+				log.Fatalf("mkdir failed![%v]\n", err)
 			}
 		}
 	}
@@ -241,21 +243,10 @@ func initTPL() {
 	}
 }
 
-func getInt(s string) int {
-	num, _ := strconv.Atoi(s)
-	return num
-}
-
-func (m *MysqlConfig) GetMysqlConnectingString() string {
-	usr := m.User
-	pwd := m.Password
-	host := m.Host
-	port := m.Port
-	db := m.DB
-	return fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=true", usr, pwd, host, port, db)
-}
-
 func isInTests() bool {
+	if flag.Lookup("test.v") != nil {
+		return true
+	}
 	for _, arg := range os.Args {
 		if strings.HasPrefix(arg, "-test") {
 			if arg == "-testtpl" {

@@ -1,152 +1,219 @@
 package bot
 
 import (
+	"context"
+	"fmt"
+	"strings"
 	"time"
 
-	"github.com/indes/flowerss-bot/internal/bot/fsm"
-	"github.com/indes/flowerss-bot/internal/config"
-	"github.com/indes/flowerss-bot/internal/util"
-	
 	"go.uber.org/zap"
-	tb "gopkg.in/tucnak/telebot.v2"
+	tb "gopkg.in/telebot.v3"
+
+	"github.com/indes/flowerss-bot/internal/bot/handler"
+	"github.com/indes/flowerss-bot/internal/bot/middleware"
+	"github.com/indes/flowerss-bot/internal/bot/preview"
+	"github.com/indes/flowerss-bot/internal/config"
+	"github.com/indes/flowerss-bot/internal/core"
+	"github.com/indes/flowerss-bot/internal/log"
+	"github.com/indes/flowerss-bot/internal/model"
 )
 
-var (
-	// UserState 用户状态，用于标示当前用户操作所在状态
-	UserState map[int64]fsm.UserStatus = make(map[int64]fsm.UserStatus)
+type Bot struct {
+	core *core.Core
+	tb   *tb.Bot // telebot.Bot instance
+}
 
-	// B telebot
-	B *tb.Bot
-)
-
-func init() {
-	if config.RunMode == config.TestMode {
-		return
-	}
-	poller := &tb.LongPoller{Timeout: 10 * time.Second}
-	spamProtected := tb.NewMiddlewarePoller(poller, func(upd *tb.Update) bool {
-		if !isUserAllowed(upd) {
-			// 检查用户是否可以使用bot
-			return false
-		}
-
-		if !CheckAdmin(upd) {
-			return false
-		}
-		return true
-	})
-	zap.S().Infow("init telegram bot",
-		"token", config.BotToken,
-		"endpoint", config.TelegramEndpoint,
-	)
-
-	// create bot
-	var err error
-
-	B, err = tb.NewBot(tb.Settings{
+func NewBot(core *core.Core) *Bot {
+	log.Infof("init telegram bot, token %s, endpoint %s", config.BotToken, config.TelegramEndpoint)
+	settings := tb.Settings{
 		URL:    config.TelegramEndpoint,
 		Token:  config.BotToken,
-		Poller: spamProtected,
-		Client: util.HttpClient,
-	})
+		Poller: &tb.LongPoller{Timeout: 10 * time.Second},
+		Client: core.HttpClient().Client(),
+	}
 
+	logLevel := config.GetString("log.level")
+	if strings.ToLower(logLevel) == "debug" {
+		settings.Verbose = true
+	}
+
+	b := &Bot{
+		core: core,
+	}
+
+	var err error
+	b.tb, err = tb.NewBot(settings)
 	if err != nil {
-		zap.S().Fatal(err)
-		return
+		log.Error(err)
+		return nil
+	}
+	b.tb.Use(middleware.UserFilter(), middleware.PreLoadMentionChat(), middleware.IsChatAdmin())
+	return b
+}
+
+func (b *Bot) registerCommands(appCore *core.Core) error {
+	commandHandlers := []handler.CommandHandler{
+		handler.NewStart(),
+		handler.NewPing(b.tb),
+		handler.NewAddSubscription(appCore),
+		handler.NewRemoveSubscription(b.tb, appCore),
+		handler.NewListSubscription(appCore),
+		handler.NewRemoveAllSubscription(),
+		handler.NewOnDocument(b.tb, appCore),
+		handler.NewSet(b.tb, appCore),
+		handler.NewSetFeedTag(appCore),
+		handler.NewSetUpdateInterval(appCore),
+		handler.NewExport(appCore),
+		handler.NewImport(),
+		handler.NewPauseAll(appCore),
+		handler.NewActiveAll(appCore),
+		handler.NewHelp(),
+		handler.NewVersion(),
+	}
+
+	for _, h := range commandHandlers {
+		b.tb.Handle(h.Command(), h.Handle, h.Middlewares()...)
+	}
+
+	ButtonHandlers := []handler.ButtonHandler{
+		handler.NewRemoveAllSubscriptionButton(appCore),
+		handler.NewCancelRemoveAllSubscriptionButton(),
+		handler.NewSetFeedItemButton(b.tb, appCore),
+		handler.NewRemoveSubscriptionItemButton(appCore),
+		handler.NewNotificationSwitchButton(b.tb, appCore),
+		handler.NewSetSubscriptionTagButton(b.tb),
+		handler.NewTelegraphSwitchButton(b.tb, appCore),
+		handler.NewSubscriptionSwitchButton(b.tb, appCore),
+	}
+
+	for _, h := range ButtonHandlers {
+		b.tb.Handle(h, h.Handle, h.Middlewares()...)
+	}
+
+	var commands []tb.Command
+	for _, h := range commandHandlers {
+		if h.Description() == "" {
+			continue
+		}
+		commands = append(commands, tb.Command{Text: h.Command(), Description: h.Description()})
+	}
+	log.Debugf("set bot command %+v", commands)
+	if err := b.tb.SetCommands(commands); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (b *Bot) Run() error {
+	if config.RunMode == config.TestMode {
+		return nil
+	}
+
+	if err := b.registerCommands(b.core); err != nil {
+		return err
+	}
+	log.Infof("bot start %s", config.AppVersionInfo())
+	b.tb.Start()
+	return nil
+}
+
+func (b *Bot) SourceUpdate(
+	source *model.Source, newContents []*model.Content, subscribes []*model.Subscribe,
+) {
+	b.BroadcastNews(source, subscribes, newContents)
+}
+
+func (b *Bot) SourceUpdateError(source *model.Source) {
+	b.BroadcastSourceError(source)
+}
+
+// BroadcastNews send new contents message to subscriber
+func (b *Bot) BroadcastNews(source *model.Source, subs []*model.Subscribe, contents []*model.Content) {
+	zap.S().Infow(
+		"broadcast news",
+		"fetcher id", source.ID,
+		"fetcher title", source.Title,
+		"subscriber count", len(subs),
+		"new contents", len(contents),
+	)
+
+	for _, content := range contents {
+		previewText := preview.TrimDescription(content.Description, config.PreviewText)
+
+		for _, sub := range subs {
+			tpldata := &config.TplData{
+				SourceTitle:     source.Title,
+				ContentTitle:    content.Title,
+				RawLink:         content.RawLink,
+				PreviewText:     previewText,
+				TelegraphURL:    content.TelegraphURL,
+				Tags:            sub.Tag,
+				EnableTelegraph: sub.EnableTelegraph == 1 && content.TelegraphURL != "",
+			}
+
+			u := &tb.User{
+				ID: sub.UserID,
+			}
+			o := &tb.SendOptions{
+				DisableWebPagePreview: config.DisableWebPagePreview,
+				ParseMode:             config.MessageMode,
+				DisableNotification:   sub.EnableNotification != 1,
+			}
+			msg, err := tpldata.Render(config.MessageMode)
+			if err != nil {
+				zap.S().Errorw(
+					"broadcast news error, tpldata.Render err",
+					"error", err.Error(),
+				)
+				return
+			}
+			if _, err := b.tb.Send(u, msg, o); err != nil {
+
+				if strings.Contains(err.Error(), "Forbidden") {
+					zap.S().Errorw(
+						"broadcast news error, bot stopped by user",
+						"error", err.Error(),
+						"user id", sub.UserID,
+						"source id", sub.SourceID,
+						"title", source.Title,
+						"link", source.Link,
+					)
+					b.core.Unsubscribe(context.Background(), sub.UserID, sub.SourceID)
+				}
+
+				/*
+					Telegram return error if markdown message has incomplete format.
+					Print the msg to warn the user
+					api error: Bad Request: can't parse entities: Can't find end of the entity starting at byte offset 894
+				*/
+				if strings.Contains(err.Error(), "parse entities") {
+					zap.S().Errorw(
+						"broadcast news error, markdown error",
+						"markdown msg", msg,
+						"error", err.Error(),
+					)
+				}
+			}
+		}
 	}
 }
 
-//Start bot
-func Start() {
-	if config.RunMode != config.TestMode {
-		zap.S().Infof("bot start %s", config.AppVersionInfo())
-		setCommands()
-		setHandle()
-		B.Start()
+// BroadcastSourceError send fetcher update error message to subscribers
+func (b *Bot) BroadcastSourceError(source *model.Source) {
+	subs, err := b.core.GetSourceAllSubscriptions(context.Background(), source.ID)
+	if err != nil {
+		log.Errorf("get subscriptions failed, %v", err)
 	}
-}
-
-func setCommands() {
-	// 设置bot命令提示信息
-	commands := []tb.Command{
-		{Text: "start", Description: "开始使用"},
-		{Text: "sub", Description: "订阅rss源"},
-		{Text: "list", Description: "当前订阅的rss源"},
-		{Text: "unsub", Description: "退订rss源"},
-		{Text: "unsuball", Description: "退订所有rss源"},
-
-		{Text: "set", Description: "设置rss订阅"},
-		{Text: "setfeedtag", Description: "设置rss订阅标签"},
-		{Text: "setinterval", Description: "设置rss订阅抓取间隔"},
-
-		{Text: "export", Description: "导出订阅为opml文件"},
-		{Text: "import", Description: "从opml文件导入订阅"},
-
-		{Text: "check", Description: "检查我的rss订阅状态"},
-		{Text: "pauseall", Description: "停止抓取订阅更新"},
-		{Text: "activeall", Description: "开启抓取订阅更新"},
-
-		{Text: "help", Description: "使用帮助"},
-		{Text: "version", Description: "bot版本"},
+	var u tb.User
+	for _, sub := range subs {
+		message := fmt.Sprintf(
+			"[%s](%s) 已经累计连续%d次更新失败，暂停更新", source.Title, source.Link, config.ErrorThreshold,
+		)
+		u.ID = sub.UserID
+		_, _ = b.tb.Send(
+			&u, message, &tb.SendOptions{
+				ParseMode: tb.ModeMarkdown,
+			},
+		)
 	}
-
-	zap.S().Debugf("set bot command %+v", commands)
-
-	if err := B.SetCommands(commands); err != nil {
-		zap.S().Errorw("set bot commands failed", "error", err.Error())
-	}
-}
-
-func setHandle() {
-	B.Handle(&tb.InlineButton{Unique: "set_feed_item_btn"}, setFeedItemBtnCtr)
-
-	B.Handle(&tb.InlineButton{Unique: "set_toggle_notice_btn"}, setToggleNoticeBtnCtr)
-
-	B.Handle(&tb.InlineButton{Unique: "set_toggle_telegraph_btn"}, setToggleTelegraphBtnCtr)
-
-	B.Handle(&tb.InlineButton{Unique: "set_toggle_update_btn"}, setToggleUpdateBtnCtr)
-
-	B.Handle(&tb.InlineButton{Unique: "set_set_sub_tag_btn"}, setSubTagBtnCtr)
-
-	B.Handle(&tb.InlineButton{Unique: "unsub_all_confirm_btn"}, unsubAllConfirmBtnCtr)
-
-	B.Handle(&tb.InlineButton{Unique: "unsub_all_cancel_btn"}, unsubAllCancelBtnCtr)
-
-	B.Handle(&tb.InlineButton{Unique: "unsub_feed_item_btn"}, unsubFeedItemBtnCtr)
-
-	B.Handle("/start", startCmdCtr)
-
-	B.Handle("/export", exportCmdCtr)
-
-	B.Handle("/sub", subCmdCtr)
-
-	B.Handle("/list", listCmdCtr)
-
-	B.Handle("/set", setCmdCtr)
-
-	B.Handle("/unsub", unsubCmdCtr)
-
-	B.Handle("/unsuball", unsubAllCmdCtr)
-
-	B.Handle("/ping", pingCmdCtr)
-
-	B.Handle("/help", helpCmdCtr)
-
-	B.Handle("/import", importCmdCtr)
-
-	B.Handle("/setfeedtag", setFeedTagCmdCtr)
-
-	B.Handle("/setinterval", setIntervalCmdCtr)
-
-	B.Handle("/check", checkCmdCtr)
-
-	B.Handle("/activeall", activeAllCmdCtr)
-
-	B.Handle("/pauseall", pauseAllCmdCtr)
-
-	B.Handle("/version", versionCmdCtr)
-
-	B.Handle(tb.OnText, textCtr)
-
-	B.Handle(tb.OnDocument, docCtr)
 }

@@ -6,18 +6,23 @@ import (
 	"syscall"
 
 	"github.com/indes/flowerss-bot/internal/bot"
-	"github.com/indes/flowerss-bot/internal/model"
-	"github.com/indes/flowerss-bot/internal/task"
-
-	_ "github.com/jinzhu/gorm/dialects/mysql"
-	_ "github.com/jinzhu/gorm/dialects/sqlite"
+	"github.com/indes/flowerss-bot/internal/core"
+	"github.com/indes/flowerss-bot/internal/log"
+	"github.com/indes/flowerss-bot/internal/scheduler"
 )
 
 func main() {
-	model.InitDB()
-	task.StartTasks()
+	appCore := core.NewCoreFormConfig()
+	if err := appCore.Init(); err != nil {
+		log.Fatal(err)
+	}
 	go handleSignal()
-	bot.Start()
+	b := bot.NewBot(appCore)
+
+	task := scheduler.NewRssTask(appCore)
+	task.Register(b)
+	task.Start()
+	b.Run()
 }
 
 func handleSignal() {
@@ -26,7 +31,5 @@ func handleSignal() {
 
 	<-c
 
-	task.StopTasks()
-	model.Disconnect()
 	os.Exit(0)
 }
